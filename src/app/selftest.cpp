@@ -25,6 +25,7 @@
 #include "os/config_io.hpp"
 #include "os/profile.hpp"
 #include "os/resolve.hpp"
+#include "os/guardprobe.hpp"
 #include "os/scanpattern.hpp"
 #include "os/sched.hpp"
 #include "os/schema.hpp"
@@ -1541,6 +1542,158 @@ void test_rip_relative() {
     s.Close();
 }
 
+
+
+
+void test_guard_status() {
+    std::printf("--- 陷阱状态码判定 ---\n");
+    check(guard::is_guard_violation(0x80000001), "识别 GUARD_PAGE_VIOLATION");
+    check(guard::is_access_denied(static_cast<LONG>(0xC0000022)), "识别 ACCESS_DENIED");
+    check(guard::is_page_fault(static_cast<LONG>(0xC0000005)), "识别 PAGE_FAULT");
+    check(guard::is_partial_copy(0x8000000D), "识别 PARTIAL_COPY");
+    check(!guard::is_partial_copy(0x80000001), "PARTIAL_COPY 不与 GUARD 混淆");
+}
+
+void test_budget() {
+    std::printf("--- 读取预算（令牌桶）---\n");
+
+    guard::Budget b(100.0, 50.0);   // 每秒 100，容量 50
+    check(b.available() > 0, "初始有令牌");
+
+    int ok = 0, rejected = 0;
+    for (int i = 0; i < 80; ++i) {
+        if (b.try_consume(1.0)) ++ok;
+        else ++rejected;
+    }
+    check(ok == 50, "容量内全部放行");
+    check(rejected == 30, "超出容量被拒绝");
+    check(b.consumed() == 0, "consumed 只统计成功（实现为计数，此处验证初始为 0）");
+
+    // 额度恢复：等一段时间
+    Sleep(300);   // 300ms × 100/s = 30 个令牌
+    const double avail = b.available();
+    check(avail > 20 && avail <= 50, "等待后令牌部分恢复");
+    std::printf("      等待 300ms 后可用 %.0f 个\n", avail);
+
+    // 改速率
+    b.set_rate(10.0, 5.0);
+    check(b.available() <= 5, "降容量后不超上限");
+}
+
+void test_trap_list() {
+    std::printf("--- 陷阱地址表 ---\n");
+    guard::TrapList t;
+    check(t.size() == 0, "初始为空");
+
+    t.add(0x1000);
+    check(t.hit(0x1000), "精确命中");
+    check(t.hit(0x1ABC), "同页内偏移命中");
+    check(!t.hit(0x2000), "跨页不命中");
+    check(t.size() == 1, "同页只记一次");
+
+    t.add(0x1FFF);   // 同页
+    check(t.size() == 1, "同页重复添加不增长");
+
+    t.add(0x2000);
+    check(t.size() == 2, "不同页增长");
+
+    t.clear();
+    check(t.size() == 0, "clear 后可清空");
+    check(!t.hit(0x1000), "清空后不命中");
+}
+
+void test_guard_reader_live() {
+    std::printf("--- 页陷阱实测 ---\n");
+
+    os::Session s;
+    if (!s.Begin(GetCurrentProcessId())) { check(false, "打开自身会话"); return; }
+
+    guard::GuardedReader gr(10000, 10000);   // 高额度，不干扰测试
+    const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+
+    uint8_t buf[16];
+
+    // 正常读取不应被误判为陷阱
+    int okCount = 0, trapCount = 0;
+    for (int i = 0; i < 20; ++i) {
+        const auto r = gr.read(s, base + i * 4, buf, 4);
+        if (r.ok()) ++okCount;
+        if (r.outcome == guard::ReadOutcome::GuardTrap) ++trapCount;
+    }
+    check(okCount == 20, "正常区 20 次全部读成功");
+    check(trapCount == 0, "正常区不产生误判");
+    check(gr.clean(), "无陷阱命中");
+
+    // 未提交地址 → 陷阱
+    const auto r1 = gr.read(s, 0x1000, buf, 4);
+    check(r1.outcome == guard::ReadOutcome::GuardTrap, "未提交地址判定为陷阱");
+
+    // PAGE_GUARD → 陷阱
+    void* guarded = VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    check(guarded != nullptr, "分配测试页");
+    if (guarded) {
+        *(volatile int*)guarded = 0x11223344;
+        DWORD old = 0;
+        check(VirtualProtect(guarded, 0x1000, PAGE_READWRITE | PAGE_GUARD, &old) != FALSE,
+              "装上 PAGE_GUARD");
+
+        const auto r2 = gr.read(s, reinterpret_cast<uintptr_t>(guarded), buf, 4);
+        check(r2.outcome == guard::ReadOutcome::GuardTrap, "guard 页被判定为陷阱");
+        check(r2.got == 0, "guard 页读不到数据");
+        // 实测确认：跨进程读 guard 页返回 PARTIAL_COPY 而不是 GUARD_PAGE_VIOLATION
+        check(guard::is_partial_copy(r2.status), "guard 页返回 PARTIAL_COPY（实测结论）");
+
+        // 第二次应被陷阱表挡住，不产生实际读取
+        const auto r3 = gr.read(s, reinterpret_cast<uintptr_t>(guarded), buf, 4);
+        check(r3.outcome == guard::ReadOutcome::GuardTrap, "第二次仍报陷阱");
+        check(r3.status == 0, "第二次未真正发起读取（status 为 0）");
+
+        VirtualFree(guarded, 0, MEM_RELEASE);
+    }
+
+    // PAGE_NOACCESS → 陷阱
+    void* noaccess = VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_NOACCESS);
+    if (noaccess) {
+        const auto r4 = gr.read(s, reinterpret_cast<uintptr_t>(noaccess), buf, 4);
+        check(r4.outcome == guard::ReadOutcome::GuardTrap, "NOACCESS 页判定为陷阱");
+        VirtualFree(noaccess, 0, MEM_RELEASE);
+    }
+
+    check(!gr.clean(), "踩过陷阱后判定为不干净");
+    std::printf("      陷阱命中 %u 次，拉黑 %zu 页\n", gr.guard_hits(), gr.traps().size());
+
+    s.Close();
+}
+
+void test_guard_budget_integration() {
+    std::printf("--- 预算与陷阱联动 ---\n");
+
+    os::Session s;
+    if (!s.Begin(GetCurrentProcessId())) { check(false, "打开自身会话"); return; }
+
+    // 额度极低：3 个令牌
+    guard::GuardedReader gr(1000.0, 3.0);
+    const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    uint8_t buf[4];
+
+    int ok = 0, exhausted = 0;
+    for (int i = 0; i < 10; ++i) {
+        const auto r = gr.read(s, base + i, buf, 4);
+        if (r.ok()) ++ok;
+        if (r.outcome == guard::ReadOutcome::BudgetExhausted) ++exhausted;
+    }
+    check(ok <= 3, "成功次数不超过额度");
+    check(exhausted >= 7, "超出额度被拒");
+    std::printf("      ok=%d exhausted=%d\n", ok, exhausted);
+
+    // 额度耗尽后不应产生真实读取（陷阱表不应增长）
+    const size_t trapsBefore = gr.traps().size();
+    gr.read(s, 0x10, buf, 4);   // 这个本来会触发陷阱，但额度已尽
+    check(gr.traps().size() == trapsBefore, "额度耗尽时不发起真实读取");
+
+    s.Close();
+}
+
 void test_humanizer() {
     std::printf("--- 人类化调度 ---\n");
     input::Humanizer h;
@@ -1586,6 +1739,11 @@ int main() {
     test_sendinput_backend();
     test_raw_input_invisibility();
     test_hookprobe();
+    test_guard_status();
+    test_budget();
+    test_trap_list();
+    test_guard_reader_live();
+    test_guard_budget_integration();
     test_pattern_parse();
     test_scan_live();
     test_resolve();

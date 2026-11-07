@@ -7,7 +7,7 @@
 ```
 依赖: advapi32 / bcrypt / kernel32 / msvcrt / user32
 敏感导入: 0（OpenProcess / ReadProcessMemory / CreateRemoteThread / SetWindowsHookEx 全部不出现）
-自检: 365 项断言
+自检: 468 项断言
 ```
 
 ## 为什么是纯读取
@@ -47,7 +47,7 @@ src/
 ├─ common/    hash  obf  rnd  ringlog  cfg
 ├─ os/        process  handles  sched  task  scan
 │             schema  resolve  gamestate  config_io  profile
-│             scanpattern（AOB 特征码扫描）
+│             scanpattern（AOB 特征码扫描）   guardprobe（陷阱/预算）
 ├─ stealth/   api  antidebug  ident  manifest
 │             manualmap  inject  pebunlink      攻击能力，主路径不用
 ├─ input/     backend  u32  driver  driver_proto  hookprobe
@@ -215,7 +215,7 @@ MinGW 的 `libwinpthread` 通过 `sched.o` / `thread.o` 会把 `OpenProcess`、`
 ./build/probe_hookdetect.exe
 ```
 
-## 已验证（365 项断言）
+## 已验证（468 项断言）
 
 | 能力 | 验证方式 |
 |---|---|
@@ -232,6 +232,8 @@ MinGW 的 `libwinpthread` 通过 `sched.o` / `thread.o` 会把 `OpenProcess`、`
 | profile 解析 + 钳制 | 边界值全测 |
 | 句柄审计 | 持有/释放/伪句柄全测 |
 | AOB 特征码扫描 | 三种写法解析一致 + 唯一性拒绝 + disp 解析地址可读 |
+| 页陷阱探测 | 实测 guard/NOACCESS/未提交 均判定为陷阱，正常区零误判 |
+| 读取预算 | 令牌桶容量/恢复/联动全测 |
 | IPC 帧协议 | 正反向 + 大载荷 + 超限拒绝 |
 | 驱动协议布局 | `static_assert` 锁死 + 无驱动优雅失败 |
 | 手工映射错误路径 | 8 种错误码 |
@@ -251,7 +253,7 @@ MinGW 的 `libwinpthread` 通过 `sched.o` / `thread.o` 会把 `OpenProcess`、`
 
 | 分支 | 内容 | 断言 |
 |---|---|---|
-| `main` | 通用框架，零游戏特定内容 | 365 |
+| `main` | 通用框架，零游戏特定内容 | 468 |
 | `game/wow-classic` | 魔兽世界怀旧服层（`src/games/wow/` + profile + 偏移表骨架） | 407 |
 
 约定：
