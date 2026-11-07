@@ -1,0 +1,26 @@
+# build
+build/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.idb
+*.map
+
+# driver artifacts
+driver/*.sys
+driver/*.pfx
+driver/*.pvk
+driver/*.cer
+
+# runtime state
+*.log
+*.dat
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.suo
