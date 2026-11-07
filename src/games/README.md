@@ -90,4 +90,11 @@ if (profile.require_all_fields) { ... }
 ```
 
 框架里出现任何游戏名，都会让这个仓库退化成"只能给一个游戏用"。
-`main` 上搜索 `wow|warcraft` 应该 0 命中——这是每次提交前该跑的检查。
+`main` 的源码里搜索 `wow|warcraft` 应该 0 命中——这是每次提交前该跑的检查：
+
+```bash
+grep -rniE "wow|warcraft" src/ tools/ --include="*.hpp" --include="*.cpp" | grep -vi wow64
+# 无输出 = 通过
+```
+
+文档（`*.md`）里出现分支名是合法的——文档本来就要描述分支结构。

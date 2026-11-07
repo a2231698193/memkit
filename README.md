@@ -254,7 +254,8 @@ MinGW 的 `libwinpthread` 通过 `sched.o` / `thread.o` 会把 `OpenProcess`、`
 
 约定：
 
-- `main` 里搜索 `wow|warcraft|wowmvc` 必须 0 命中
+- `main` 的 **源码**（`src/` `tools/`）里搜索 `wow|warcraft` 必须 0 命中。
+  文档里出现分支名是合法的——文档的作用就是描述分支
 - 游戏分支从 `main` 拉出，只加 `src/games/<name>/`、`profiles/`、`tables/<name>/`
 - 框架改动先落 `main`，再 rebase 到各游戏分支
 - 多个游戏分支都需要的改动才回合 `main`
