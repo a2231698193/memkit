@@ -48,11 +48,15 @@ src/
 ├─ os/        process  handles  sched  task  scan
 │             schema  resolve  gamestate  config_io  profile
 ├─ stealth/   api  antidebug  ident  manifest
+│             manualmap  inject  pebunlink      攻击能力，主路径不用
 ├─ input/     backend  u32  driver  driver_proto  hookprobe
 ├─ ipc/       channel
-└─ app/       main  selftest
+├─ games/     ← 空（main 分支不含任何游戏代码）
+└─ app/       main  selftest  wrap_stub
 driver/       可选内核驱动（默认不构建）
 tables/       偏移表实例（按游戏分目录）
+profiles/     ← 空（main 分支不含）
+examples/     格式示例（profile + 偏移表）
 tools/        audit  strip_pe  实测探针
 ```
 
@@ -230,21 +234,48 @@ MinGW 的 `libwinpthread` 通过 `sched.o` / `thread.o` 会把 `OpenProcess`、`
 | 驱动协议布局 | `static_assert` 锁死 + 无驱动优雅失败 |
 | 手工映射错误路径 | 8 种错误码 |
 
-## 待扩展
+## 待扩展（main 分支）
 
 | 项 | 说明 |
 |---|---|
-| 4x4 矩阵 VType | WorldToScreen 需要 16 float，当前只有 vec3 |
-| AOB 扫描 | `Kind::Scan` 预留未实现，用于版本更新后自动重定位静态基址 |
-| 容器遍历 | 部分游戏的实体列表不是连续数组（自平衡树 + 环形缓冲） |
-| 指针链批量解析 | 当前逐字段走链，可以合并成一次批量批处理 |
+| `Mat4` / `Vec2` 类型 | `game/wow-classic` 已实现，尚未回合 main。main 上 `VType` 只有 `vec3` 及以下 |
+| AOB 扫描 | `Kind::Scan` 只在解析/序列化里留了枚举，`Resolver` 未实现。用于版本更新后自动重定位静态基址 |
+| 容器遍历 | 抽象层没有容器概念。实体列表遍历在游戏分支各自实现 |
+| 指针链批量解析 | 当前逐字段走链，可以合并成一次批处理减少往返 |
 
-## 分支约定
+合回 main 的判据：**多个游戏分支都需要**。只有一个游戏用的东西留在分支里。
 
-- `main`：通用框架，不含任何游戏特定内容
-- `game/<name>`：单个游戏的 profile + 偏移表 + 业务逻辑
+## 分支
 
-框架改动从 `main` 合入；游戏改动只在各自分支内。
+| 分支 | 内容 | 断言 |
+|---|---|---|
+| `main` | 通用框架，零游戏特定内容 | 323 |
+| `game/wow-classic` | 魔兽世界怀旧服层（`src/games/wow/` + profile + 偏移表骨架） | 390 |
+
+约定：
+
+- `main` 里搜索 `wow|warcraft|wowmvc` 必须 0 命中
+- 游戏分支从 `main` 拉出，只加 `src/games/<name>/`、`profiles/`、`tables/<name>/`
+- 框架改动先落 `main`，再 rebase 到各游戏分支
+- 多个游戏分支都需要的改动才回合 `main`
+
+### 游戏分支怎么开
+
+```bash
+git checkout main
+git checkout -b game/<name>
+
+# 加这些，别动 src/ 下已有的框架文件
+mkdir -p src/games/<name> profiles tables/<name>
+cp examples/profile-example.txt profiles/<name>.txt
+cp examples/table-example.txt   tables/<name>/template.txt
+
+# 编译时打开对应开关
+cmake -S . -B build -DMEMKIT_GAME_<NAME>=ON
+```
+
+`src/games/<name>/` 只允许 include `os/` `common/`，不允许反向依赖。
+如果发现框架缺东西，改成框架能力后再回 `main`。
 
 ## 免责
 
