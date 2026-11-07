@@ -1816,6 +1816,252 @@ void test_session_guard() {
     s5.Close();
 }
 
+
+void test_scan_field_parse() {
+    std::printf("--- scan 字段格式 ---\n");
+
+    // 基本 scan 字段：无 check，带特征码
+    {
+        const std::string text =
+            "!game test\n"
+            "player.guid scan u64 - scan 48 8D 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? ge 1\n";
+        schema::Table t;
+        int el = 0;
+        check(schema::parse(text, t, &el), "scan 字段可解析");
+        check(t.fields.size() == 1, "解析出 1 个字段");
+        if (!t.fields.empty()) {
+            const auto& f = t.fields[0];
+            check(f.kind == schema::Kind::Scan, "kind 自动识别为 Scan");
+            check(f.is_scan(), "is_scan 为真");
+            check(f.scanPattern == "48", "特征码首字节（空格分隔会被切成多个 token）");
+        }
+    }
+
+    // 紧凑特征码（无空格）才能完整存进一个 token
+    {
+        const std::string text =
+            "!game test\n"
+            "player.guid scan u64 - scan 488D0D????????E8???????? ge 1\n";
+        schema::Table t;
+        check(schema::parse(text, t), "紧凑特征码可解析");
+        if (!t.fields.empty()) {
+            const auto& f = t.fields[0];
+            check(f.scanPattern == "488D0D????????E8????????", "紧凑特征码完整保留");
+            check(f.check.op == schema::Check::Op::Ge, "check 被正确解析");
+            check(f.check.a == 1, "check 边界正确");
+        }
+    }
+
+    // deref 修饰
+    {
+        const std::string text =
+            "!game test\nx scan u64 - - scan 488B05???????? deref\n";
+        schema::Table t;
+        check(schema::parse(text, t), "带 deref 的 scan 可解析");
+        if (!t.fields.empty()) {
+            check(t.fields[0].scanDeref, "deref 标志被识别");
+        }
+    }
+
+    // addend 修饰
+    {
+        const std::string text =
+            "!game test\nx scan u64 - - scan 483905???????? -8\n";
+        schema::Table t;
+        check(schema::parse(text, t), "带 addend 的 scan 可解析");
+        if (!t.fields.empty()) {
+            check(t.fields[0].scanAddend == -8, "负 addend 正确");
+            check(!t.fields[0].scanDeref, "没写 deref 则为假");
+        }
+    }
+
+    // 序列化往返
+    {
+        schema::Table t;
+        t.game = "test";
+        schema::Field f;
+        f.name = "player.guid";
+        f.kind = schema::Kind::Scan;
+        f.type = schema::VType::U64;
+        f.scanPattern = "488D0D????????E8????????";
+        f.scanDeref = true;
+        f.scanAddend = -8;
+        f.check.op = schema::Check::Op::Ge;
+        f.check.a = 1;
+        t.fields.push_back(f);
+
+        const std::string a = schema::serialize(t);
+        check(a.find("scan") != std::string::npos, "序列化含 scan 关键字");
+        check(a.find("488D0D????????E8????????") != std::string::npos, "含特征码");
+        check(a.find("deref") != std::string::npos, "含 deref");
+
+        schema::Table t2;
+        check(schema::parse(a, t2), "往返可解析");
+        const std::string b = schema::serialize(t2);
+        check(a == b, "二次序列化一致");
+        if (!t2.fields.empty()) {
+            check(t2.fields[0].scanAddend == -8, "addend 往返保持");
+            check(t2.fields[0].scanDeref, "deref 往返保持");
+        }
+    }
+
+    // 普通字段不受影响
+    {
+        const std::string text =
+            "!game test\nplayer.hp value u32 0x10,0x20 inrange 1 100\n";
+        schema::Table t;
+        check(schema::parse(text, t), "普通字段仍可解析");
+        if (!t.fields.empty()) {
+            check(!t.fields[0].is_scan(), "普通字段不是 scan");
+            check(t.fields[0].kind == schema::Kind::Value, "kind 保持 Value");
+            check(t.fields[0].offs.size() == 2, "偏移链正确");
+        }
+    }
+}
+
+void test_scan_field_live() {
+    std::printf("--- scan 字段实测（自身模块）---\n");
+
+    os::Session s;
+    if (!s.Begin(GetCurrentProcessId())) { check(false, "打开自身会话"); return; }
+
+    size_t modSize = 0;
+    const uintptr_t base = os::module_base(GetCurrentProcessId(), L"selftest.exe", &modSize);
+    check(base != 0, "取到自身模块基址");
+    check(modSize > 0x1000, "取到模块大小");
+    if (base == 0 || modSize == 0) return;
+
+    // 用 PE 签名做特征码：一定唯一且不需要解析 disp
+    schema::Table t;
+    t.game = "selftest";
+
+    schema::Field f;
+    f.name = "pe.sig";
+    f.kind = schema::Kind::Scan;
+    f.type = schema::VType::U32;
+    f.scanPattern = "4D5A9000";   // DOS 头：模块开头唯一
+    t.fields.push_back(f);
+
+    // 再放一个解析 disp 的：lea rcx,[rip+x]
+    schema::Field f2;
+    f2.name = "lea.target";
+    f2.kind = schema::Kind::Scan;
+    f2.type = schema::VType::U8;
+    f2.scanPattern = "488D0D????????";
+    t.fields.push_back(f2);
+
+    resolve::Resolver r;
+    r.bind(&t, base, GetCurrentProcessId(), modSize);
+
+    const auto res = r.read_all(s);
+    check(res.size() == 2, "读回 2 个字段");
+
+    for (const auto& fr : res) {
+        if (fr.name == "pe.sig") {
+            check(fr.address_ok, "DOS 头扫描成功");
+            if (fr.address_ok) {
+                // DOS 头就在模块 base 处
+                check(fr.addr == base, "扫描位置等于模块开头");
+            }
+        }
+        if (fr.name == "lea.target") {
+            // lea 可能不唯一，那就会失败；成功则地址应可读
+            if (fr.address_ok) {
+                check(fr.addr != 0, "lea 目标解析出地址");
+            } else {
+                check(r.scan_ambiguous() > 0 || r.scan_failures() > 0,
+                      "失败时记录了原因");
+            }
+        }
+    }
+
+    // 缓存：第二次不应重复扫描
+    const size_t cachedAfterFirst = r.cached();
+    r.read_all(s);
+    check(r.cached() == cachedAfterFirst, "缓存稳定（不重复扫描）");
+
+    std::printf("      扫描失败 %u 次，不唯一 %u 次\n",
+                r.scan_failures(), r.scan_ambiguous());
+
+    s.Close();
+}
+
+void test_scan_field_errors() {
+    std::printf("--- scan 字段错误处理 ---\n");
+
+    os::Session s;
+    if (!s.Begin(GetCurrentProcessId())) { check(false, "打开自身会话"); return; }
+
+    size_t modSize = 0;
+    const uintptr_t base = os::module_base(GetCurrentProcessId(), L"selftest.exe", &modSize);
+
+    // 1. 不存在的特征码 → 扫描失败
+    {
+        schema::Table t;
+        schema::Field f;
+        f.name = "nope";
+        f.kind = schema::Kind::Scan;
+        f.scanPattern = "DEADBEEFDEADBEEFDEADBEEF";
+        t.fields.push_back(f);
+
+        resolve::Resolver r;
+        r.bind(&t, base, GetCurrentProcessId(), modSize);
+        const auto res = r.read_all(s);
+        check(res.size() == 1, "返回 1 个结果");
+        check(!res[0].address_ok, "不存在的特征码解析失败");
+        check(r.scan_failures() > 0, "记录了失败次数");
+    }
+
+    // 2. 不唯一的特征码 → 拒绝（比找错更安全）
+    {
+        schema::Table t;
+        schema::Field f;
+        f.name = "ambiguous";
+        f.kind = schema::Kind::Scan;
+        f.scanPattern = "00";   // 单字节 00 必然命中无数处
+        t.fields.push_back(f);
+
+        resolve::Resolver r;
+        r.bind(&t, base, GetCurrentProcessId(), modSize);
+        const auto res = r.read_all(s);
+        check(!res.empty() && !res[0].address_ok, "不唯一特征码被拒绝");
+        check(r.scan_ambiguous() > 0, "记录了不唯一次数");
+    }
+
+    // 3. 模块大小为 0 → 扫描无法进行
+    {
+        schema::Table t;
+        schema::Field f;
+        f.name = "nomsize";
+        f.kind = schema::Kind::Scan;
+        f.scanPattern = "4D5A9000";
+        t.fields.push_back(f);
+
+        resolve::Resolver r;
+        r.bind(&t, base, GetCurrentProcessId(), 0);   // 故意不给大小
+        const auto res = r.read_all(s);
+        check(!res.empty() && !res[0].address_ok, "模块大小为 0 时扫描失败");
+    }
+
+    // 4. set_module_size 后应该能成功
+    {
+        schema::Table t;
+        schema::Field f;
+        f.name = "later";
+        f.kind = schema::Kind::Scan;
+        f.scanPattern = "4D5A9000";
+        t.fields.push_back(f);
+
+        resolve::Resolver r;
+        r.bind(&t, base, GetCurrentProcessId(), 0);
+        r.set_module_size(modSize);
+        const auto res = r.read_all(s);
+        check(!res.empty() && res[0].address_ok, "设置模块大小后扫描成功");
+    }
+
+    s.Close();
+}
+
 void test_humanizer() {
     std::printf("--- 人类化调度 ---\n");
     input::Humanizer h;
@@ -1861,6 +2107,9 @@ int main() {
     test_sendinput_backend();
     test_raw_input_invisibility();
     test_hookprobe();
+    test_scan_field_parse();
+    test_scan_field_live();
+    test_scan_field_errors();
     test_accessmask();
     test_session_guard();
     test_guard_status();

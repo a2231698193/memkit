@@ -271,3 +271,138 @@ uintptr_t base = os::module_base(pid, L"Game.exe", &modSize);
 - disp 解析出的地址可读
 - **不唯一模式被拒绝**
 - 不存在的模式返回失败
+
+---
+
+## 集成进偏移表（已实现）
+
+`Kind::Scan` 现在可以直接写进偏移表，启动时现算地址。
+
+### 格式
+
+```
+name  kind  type  offs  check  scan <pattern> [deref] [addend]
+```
+
+| 部分 | 说明 |
+|---|---|
+| `offs` | Scan 字段写 `-`（忽略），地址完全由扫描决定 |
+| `check` | 照常写，支持 `-` / `eq` / `ne` / `le` / `ge` / `inrange` |
+| `scan` | 关键字 |
+| `<pattern>` | 特征码，**必须无空格**（紧凑写法） |
+| `deref` | 可选。扫描结果再解引用一次（目标存的是指针而非值） |
+| `addend` | 可选。结果叠加偏移，支持负数，如 `-8` |
+
+### 示例
+
+```
+!game      demo
+!build     1.0.0
+
+# GUID 直接定位
+player.guid  scan  u64  -  ge 1  scan 488D0D????????E8????????4883BC24
+
+# 带 -8 修饰（同一段特征码里取前一个字段）
+target.guid  scan  u64  -  ge 0  scan 483905????????75??B1 -8
+
+# 带 +8 修饰 + 严格范围验证
+player.hp    scan  u32  -  inrange 1 200000  scan 488B05????????33DB 8
+
+# 需要解引用（特征是"指向对象的指针"）
+entity.mgr   scan  u64  -  -  scan 488B0D????????4885C9 deref
+```
+
+### 重要限制：特征码不能有空格
+
+解析器按空白切分 token，所以特征码必须写成紧凑形式：
+
+```
+✅ 488D0D????????E8????????
+❌ 48 8D 0D ?? ?? ?? ?? E8 ?? ?? ?? ??
+```
+
+`scanpattern.hpp` 的 `parse_pattern` 两种都支持，但**偏移表这一层只能用紧凑式**。要改成支持带空格需要在 schema 解析里做引号处理，目前没做。
+
+### 顺序自由
+
+`check` 和 `scan` 的先后顺序任意，解析器是循环处理的：
+
+```
+player.hp  scan  u32  -  inrange 1 200000  scan 488B05????????33DB   # check 在前
+player.hp  scan  u32  -  scan 488B05????????33DB  inrange 1 200000   # check 在后
+```
+
+这两种写法等价。序列化输出用前一种。
+
+### 模块大小是必需的
+
+扫描需要知道模块范围。`Resolver::bind` 增加了一个参数：
+
+```cpp
+resolver.bind(table, moduleBase, pid, moduleSize);   // 扫描需要第 4 个参数
+resolver.set_module_size(modSize);                   // 也可以事后设置
+```
+
+`os::module_base` 已经支持返回大小：
+
+```cpp
+size_t modSize = 0;
+uintptr_t base = os::module_base(pid, L"Game.exe", &modSize);
+```
+
+**如果没有传模块大小，所有 scan 字段都会失败**（不是崩，是解析不出地址）。这个在 selftest 里专门测了。
+
+### 失败处理
+
+三种失败分别计数，方便诊断：
+
+| 情况 | 计数 | 含义 |
+|---|---|---|
+| 特征码找不到 | `scan_failures()` | 代码被改，需要重新挖特征码 |
+| 特征码不唯一 | `scan_ambiguous()` | 特征码太短，需要加长 |
+| 模块大小为 0 | `scan_failures()` | 调用方忘了传大小 |
+
+**不唯一时宁可不给结果**，绝不返回可能错的那个 —— 找错比找不到危险得多。
+
+### 缓存
+
+扫描结果进 `AddressCache`，同一个进程生命周期内只扫一次。
+
+失效条件同普通字段：值读失败 / 断言失败 / 模块基址变化 / pid 变化。
+
+### 测试覆盖（39 项断言）
+
+`test_scan_field_parse`（16 项）：
+```
+scan 字段可解析 / kind 自动识别 / is_scan 为真
+紧凑特征码完整保留
+check 在前和在后的两种顺序都能解析
+deref 标志识别
+负 addend 正确
+序列化往返逐字节一致
+普通字段不受影响
+```
+
+`test_scan_field_live`（7 项）：
+```
+DOS 头特征码扫描命中模块开头
+lea 的 disp 解析
+缓存稳定（不重复扫描）
+失败/不唯一计数正确
+```
+
+`test_scan_field_errors`（8 项）：
+```
+不存在的特征码 → 失败
+不唯一的特征码 → 拒绝并计数
+模块大小为 0 → 失败
+set_module_size 后 → 成功
+```
+
+### 顺带修的三个 bug
+
+1. **`!build` 为空时整行解析失败** —— 元数据行没被吃掉，落到字段解析。改成所有 `!` 开头的行一律跳过。
+
+2. **`check` 在 `scan` 之后时被忽略** —— 原来是"先 check 后 scan"的两段式。改成循环处理，两种顺序都支持。
+
+3. **不唯一计数永远为 0** —— `scan::resolve` 已经在内部返回 `ok=false`，外层再判 `r.matches > 1` 永远走不到。改成在失败分支里先判 matches。

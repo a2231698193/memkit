@@ -7,7 +7,7 @@
 ```
 依赖: advapi32 / bcrypt / kernel32 / msvcrt / user32
 敏感导入: 0（OpenProcess / ReadProcessMemory / CreateRemoteThread / SetWindowsHookEx 全部不出现）
-自检: 439 项断言
+自检: 478 项断言
 ```
 
 ## 为什么是纯读取
@@ -216,7 +216,7 @@ MinGW 的 `libwinpthread` 通过 `sched.o` / `thread.o` 会把 `OpenProcess`、`
 ./build/probe_hookdetect.exe
 ```
 
-## 已验证（439 项断言）
+## 已验证（478 项断言）
 
 | 能力 | 验证方式 |
 |---|---|
@@ -236,6 +236,7 @@ MinGW 的 `libwinpthread` 通过 `sched.o` / `thread.o` 会把 `OpenProcess`、`
 | 页陷阱探测 | 实测 guard/NOACCESS/未提交 均判定为陷阱，正常区零误判 |
 | 读取预算 | 令牌桶容量/恢复/联动全测 |
 | 权限掩码闸门 | 纯读取只给 VM_READ+QUERY_LIMITED；写/注入类位请求前拒绝 |
+| 偏移表 Scan 字段 | 特征码现算偏移，不唯一时拒绝而非返回错值 |
 | IPC 帧协议 | 正反向 + 大载荷 + 超限拒绝 |
 | 驱动协议布局 | `static_assert` 锁死 + 无驱动优雅失败 |
 | 手工映射错误路径 | 8 种错误码 |
@@ -245,7 +246,6 @@ MinGW 的 `libwinpthread` 通过 `sched.o` / `thread.o` 会把 `OpenProcess`、`
 | 项 | 说明 |
 |---|---|
 | `Mat4` / `Vec2` 类型 | `game/wow-classic` 已实现，尚未回合 main。main 上 `VType` 只有 `vec3` 及以下 |
-| `Kind::Scan` 接进偏移表 | 扫描器已实现（`os/scanpattern.hpp`，42 项断言）。缺的是让 `Resolver` 识别 `scan` 类型字段、启动时现算偏移 |
 | 容器遍历 | 抽象层没有容器概念。实体列表遍历在游戏分支各自实现 |
 | 指针链批量解析 | 当前逐字段走链，可以合并成一次批处理减少往返 |
 
@@ -255,7 +255,7 @@ MinGW 的 `libwinpthread` 通过 `sched.o` / `thread.o` 会把 `OpenProcess`、`
 
 | 分支 | 内容 | 断言 |
 |---|---|---|
-| `main` | 通用框架，零游戏特定内容 | 439 |
+| `main` | 通用框架，零游戏特定内容 | 478 |
 | `game/wow-classic` | 魔兽世界怀旧服层（`src/games/wow/` + profile + 偏移表骨架） | 407 |
 
 约定：

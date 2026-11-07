@@ -166,10 +166,12 @@ int wmain() {
             targetSeen = true;
             RLOG(Info, rlog::kEvTargetFound, 1, pid);
 
-            moduleBase = os::module_base(pid, targetMod);
+            size_t modSize = 0;
+            moduleBase = os::module_base(pid, targetMod, &modSize);
             if (moduleBase != 0 && chosen) {
                 activeTable = chosen;
-                resolver.bind(activeTable, moduleBase, pid);
+                // 扫描类字段需要模块大小，否则无法定位扫描范围
+                resolver.bind(activeTable, moduleBase, pid, modSize);
                 builder = std::make_unique<state::Builder>(resolver);
             }
             RLOG(Trace, rlog::kEvTargetFound, 2, moduleBase,

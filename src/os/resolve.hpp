@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "os/process.hpp"
+#include "os/scanpattern.hpp"
 #include "os/schema.hpp"
 
 namespace resolve {
@@ -144,9 +145,11 @@ struct FieldResult {
 //   auto results = r.read_all(session);
 class Resolver {
 public:
-    void bind(const schema::Table* table, uintptr_t moduleBase, DWORD pid) {
+    void bind(const schema::Table* table, uintptr_t moduleBase, DWORD pid,
+              size_t moduleSize = 0) {
         table_ = table;
         moduleBase_ = moduleBase;
+        moduleSize_ = moduleSize;
         if (pid != pid_) {
             pid_ = pid;
             cache_.clear();   // 换了进程必须清缓存
@@ -163,12 +166,44 @@ public:
     const schema::Table* table() const noexcept { return table_; }
     uintptr_t module_base() const noexcept { return moduleBase_; }
     size_t cached() const noexcept { return cache_.size(); }
+    void set_module_size(size_t sz) noexcept { moduleSize_ = sz; }
+    uint32_t scan_failures() const noexcept { return scanFailures_; }
+    uint32_t scan_ambiguous() const noexcept { return scanAmbiguous_; }
     void invalidate_all() { cache_.clear(); }
 
     // 解析单个字段的最终地址（会用缓存）
-    // 返回 0 表示链断了
+    // 返回 0 表示链断了 / 扫描失败
     uintptr_t resolve(os::Session& s, const schema::Field& f) {
-        if (moduleBase_ == 0 || f.offs.empty()) return 0;
+        if (moduleBase_ == 0) return 0;
+
+        // ---------- kind == Scan：特征码定位 ----------
+        // 优先级最高：有 scanPattern 就不走 offs 链。
+        // 结果进缓存，同一进程生命周期内只扫一次。
+        if (f.is_scan()) {
+            const uintptr_t cachedScan = cache_.get(f.name);
+            if (cachedScan != 0) return cachedScan;
+
+            auto r = scan::resolve(s, moduleBase_, moduleSize_, f.scanPattern,
+                                   f.scanDeref, f.scanAddend);
+            if (!r.ok) {
+                // scan::resolve 内部已经拒绝了不唯一的匹配，但保留了 matches 计数。
+                // 先判不唯一，再判普通失败 —— 否则永远走不到 ambiguous 分支。
+                if (r.matches > 1) {
+                    ++scanAmbiguous_;
+                } else {
+                    ++scanFailures_;
+                }
+                return 0;
+            }
+
+            uint8_t probe = 0;
+            if (!s.Read(r.target, &probe, 1)) return 0;
+
+            cache_.put(f.name, r.target);
+            return r.target;
+        }
+
+        if (f.offs.empty()) return 0;
 
         // kind=Offset 只有一级，不缓存（本来就是一次加法）
         if (f.kind == schema::Kind::Offset) {
@@ -299,8 +334,11 @@ public:
 private:
     const schema::Table* table_ = nullptr;
     uintptr_t moduleBase_ = 0;
+    size_t moduleSize_ = 0;
     DWORD pid_ = 0;
     AddressCache cache_;
+    uint32_t scanFailures_ = 0;
+    uint32_t scanAmbiguous_ = 0;
 };
 
 }  // namespace resolve

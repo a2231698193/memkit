@@ -37,7 +37,7 @@ enum class Kind : uint8_t {
     Chain = 0,   // 多级指针链，结果是地址
     Value = 1,   // 多级指针链 + 最终读值
     Offset = 2,  // 单级：基址 + offset
-    Scan = 3,    // 需要 AOB 扫描（预留）
+    Scan = 3,    // AOB 特征码扫描，启动时现算地址
 };
 
 enum class VType : uint8_t {
@@ -88,6 +88,19 @@ struct Field {
     std::vector<uintptr_t> offs;  // 偏移链（相对模块基址的首项，其余为解引用后加）
     Check check;            // 验证断言
     std::string note;       // 备注（怎么找到的、从哪来的）
+
+    // ---------- kind == Scan 专用 ----------
+    //
+    // 用特征码定位地址，而不是硬编码偏移。版本更新后只要特征码还有效，
+    // 偏移自动重算，不用改表。
+    //
+    // scanPattern 为空表示这个字段用 offs（普通字段）。
+    // 非空时 offs 被忽略，地址 = 扫描结果 + scanAddend（可选再解引用）。
+    std::string scanPattern;   // "48 8B 05 ?? ?? ?? ?? 33 DB"
+    int64_t scanAddend = 0;    // 扫描结果再叠加的偏移（比如 -0x8）
+    bool scanDeref = false;    // true = 扫描结果再解引用一次
+
+    bool is_scan() const noexcept { return !scanPattern.empty(); }
 };
 
 // ---------- 一张表 ----------
@@ -267,6 +280,20 @@ inline std::string serialize(const Table& t) {
                       f.name.c_str(), kind_name(f.kind), vtype_name(f.type),
                       chain.c_str(), chk.c_str());
         out += buf;
+
+        // scan 字段额外输出特征码与修饰符
+        // 格式： scan "<pattern>" [deref] [<addend>]
+        if (f.kind == Kind::Scan) {
+            out += "  scan ";
+            out += f.scanPattern.empty() ? std::string("-") : f.scanPattern;
+            if (f.scanDeref) out += " deref";
+            if (f.scanAddend != 0) {
+                std::snprintf(buf, sizeof(buf), " %lld",
+                              static_cast<long long>(f.scanAddend));
+                out += buf;
+            }
+        }
+
         if (!f.note.empty()) {
             out += "  # ";
             out += f.note;
@@ -294,24 +321,22 @@ inline bool parse(const std::string& text, Table& out, int* errLine = nullptr) {
         const auto& tok = tks.words;
         if (tok.empty()) continue;
 
-        if (tok[0] == "!game" && tok.size() >= 2) {
-            out.game = tok[1];
-            continue;
-        }
-        if (tok[0] == "!build" && tok.size() >= 2) {
-            out.build = tok[1];
-            continue;
-        }
-        if (tok[0] == "!timestamp" && tok.size() >= 2) {
-            out.exe_timestamp = static_cast<uint32_t>(detail::parse_hex(tok[1]));
-            continue;
-        }
-        if (tok[0] == "!modsize" && tok.size() >= 2) {
-            out.module_size = static_cast<uint32_t>(detail::parse_hex(tok[1]));
+        // 元数据行：即使值为空也要吃棓，不能落到字段解析
+        // （旧版本 !build 为空时会报 bline 错误）
+        if (!tok[0].empty() && tok[0][0] == '!') {
+            if (tok[0] == "!game" && tok.size() >= 2) {
+                out.game = tok[1];
+            } else if (tok[0] == "!build" && tok.size() >= 2) {
+                out.build = tok[1];
+            } else if (tok[0] == "!timestamp" && tok.size() >= 2) {
+                out.exe_timestamp = static_cast<uint32_t>(detail::parse_hex(tok[1]));
+            } else if (tok[0] == "!modsize" && tok.size() >= 2) {
+                out.module_size = static_cast<uint32_t>(detail::parse_hex(tok[1]));
+            }
             continue;
         }
 
-        // 字段行：name kind type offs [check...]
+        // 字段行：name kind type offs [check] [scan <pattern> [deref] [addend]]
         if (tok.size() < 4) {
             if (errLine) *errLine = lineNo;
             return false;
@@ -323,25 +348,77 @@ inline bool parse(const std::string& text, Table& out, int* errLine = nullptr) {
         f.type = parse_vtype(tok[2]);
         if (tok[3] != "-") f.offs = detail::parse_chain(tok[3]);
 
-        if (tok.size() >= 5) {
-            const std::string& op = tok[4];
-            if (op == "eq" && tok.size() >= 6) {
-                f.check.op = Check::Op::Eq;
-                f.check.a = strtod(tok[5].c_str(), nullptr);
-            } else if (op == "ne" && tok.size() >= 6) {
-                f.check.op = Check::Op::Ne;
-                f.check.a = strtod(tok[5].c_str(), nullptr);
-            } else if (op == "le" && tok.size() >= 6) {
-                f.check.op = Check::Op::Le;
-                f.check.a = strtod(tok[5].c_str(), nullptr);
-            } else if (op == "ge" && tok.size() >= 6) {
-                f.check.op = Check::Op::Ge;
-                f.check.a = strtod(tok[5].c_str(), nullptr);
-            } else if (op == "inrange" && tok.size() >= 7) {
-                f.check.op = Check::Op::InRange;
-                f.check.a = strtod(tok[5].c_str(), nullptr);
-                f.check.b = strtod(tok[6].c_str(), nullptr);
+        // 从 index 4 开始循环处理 check 与 scan。
+        //
+        // 两种顺序都要支持：
+        //   ... inrange 1 100 scan <pattern> deref -8     （序列化输出顺序）
+        //   ... scan <pattern> ge 1                        （手写更自然）
+        //
+        // 之前写成"先 check 后 scan"的两段式，导致 scan 后面的 check 被忽略。
+        size_t idx = 4;
+        while (idx < tok.size()) {
+            const std::string& tk = tok[idx];
+
+            if (tk == "scan") {
+                ++idx;
+                if (idx < tok.size() && tok[idx] != "-") f.scanPattern = tok[idx];
+                ++idx;
+                // deref / addend 可选
+                while (idx < tok.size()) {
+                    if (tok[idx] == "deref") {
+                        f.scanDeref = true;
+                        ++idx;
+                    } else if (tok[idx] == "-" || tok[idx] == "eq" || tok[idx] == "ne" ||
+                               tok[idx] == "le" || tok[idx] == "ge" || tok[idx] == "inrange") {
+                        break;   // 遇到下一个 check，跳出
+                    } else {
+                        f.scanAddend = strtoll(tok[idx].c_str(), nullptr, 0);
+                        ++idx;
+                        break;
+                    }
+                }
+                if (!f.scanPattern.empty()) f.kind = Kind::Scan;
+                continue;
             }
+
+            if (tk == "eq" && idx + 1 < tok.size()) {
+                f.check.op = Check::Op::Eq;
+                f.check.a = strtod(tok[idx + 1].c_str(), nullptr);
+                idx += 2;
+                continue;
+            }
+            if (tk == "ne" && idx + 1 < tok.size()) {
+                f.check.op = Check::Op::Ne;
+                f.check.a = strtod(tok[idx + 1].c_str(), nullptr);
+                idx += 2;
+                continue;
+            }
+            if (tk == "le" && idx + 1 < tok.size()) {
+                f.check.op = Check::Op::Le;
+                f.check.a = strtod(tok[idx + 1].c_str(), nullptr);
+                idx += 2;
+                continue;
+            }
+            if (tk == "ge" && idx + 1 < tok.size()) {
+                f.check.op = Check::Op::Ge;
+                f.check.a = strtod(tok[idx + 1].c_str(), nullptr);
+                idx += 2;
+                continue;
+            }
+            if (tk == "inrange" && idx + 2 < tok.size()) {
+                f.check.op = Check::Op::InRange;
+                f.check.a = strtod(tok[idx + 1].c_str(), nullptr);
+                f.check.b = strtod(tok[idx + 2].c_str(), nullptr);
+                idx += 3;
+                continue;
+            }
+            if (tk == "-") {
+                ++idx;
+                continue;
+            }
+
+            // 未知 token，跳过（容错）
+            ++idx;
         }
 
         f.note = tks.comment;
