@@ -136,14 +136,14 @@ endif()
 
 # ---------------- 实测工具（决定架构的探针程序）----------------
 # 这些小工具不进正式二进制，只在开发期用来回答"某个通道在某一层是否可见"。
-option(MEMKIT_BUILD_PROBES "Build diagnostic probes (rawspy/llspy/hookdetect)" OFF)
+option(MEMKIT_BUILD_PROBES "Build diagnostic probes (rawspy/llspy/hookdetect/injprobe)" OFF)
 if(MEMKIT_BUILD_PROBES AND NOT MSVC)
-    foreach(p rawspy llspy hookdetect)
+    foreach(p rawspy llspy hookdetect injprobe)
         add_executable(probe_${p} tools/${p}.cpp)
         target_compile_definitions(probe_${p} PRIVATE
             WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS _WIN32_WINNT=0x0A00)
         target_compile_options(probe_${p} PRIVATE -O2 -static -Wall)
         target_link_options(probe_${p} PRIVATE -static)
-        target_link_libraries(probe_${p} PRIVATE user32)
+        target_link_libraries(probe_${p} PRIVATE user32 psapi)
     endforeach()
 endif()
