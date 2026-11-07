@@ -14,6 +14,7 @@
 #include <cstdint>
 
 #include "common/hash.hpp"
+#include "os/accessmask.hpp"
 #include "stealth/api.hpp"
 
 namespace os {
@@ -74,12 +75,42 @@ public:
         return *this;
     }
 
-    // 映射场景需要 VM_OPERATION（分配/改权限/写），默认只给读权限
-    static constexpr ACCESS_MASK kReadOnly = PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION;
-    static constexpr ACCESS_MASK kWrite    = PROCESS_VM_READ | PROCESS_VM_WRITE |
-                                             PROCESS_VM_OPERATION | PROCESS_QUERY_LIMITED_INFORMATION;
+    // 掩码定义集中在 accessmask.hpp，避免各处自己拼
+    static constexpr ACCESS_MASK kReadOnly = access::kPureRead;
+    static constexpr ACCESS_MASK kWrite    = access::kMapNeeded;
 
-    bool Begin(DWORD pid, ACCESS_MASK mask = kReadOnly) {
+    // 最近一次 Begin 的审计结果（诊断用）
+    struct OpenAudit {
+        bool attempted = false;
+        bool passed = false;       // 权限掩码检查是否通过
+        ACCESS_MASK requested = 0;
+        ACCESS_MASK badBits = 0;
+        const char* reason = "";
+    };
+    const OpenAudit& last_audit() const noexcept { return audit_; }
+
+    // 打开目标进程。
+    //
+    // 关键：**在请求之前**校验权限掩码，不是开完再看。
+    // 一旦 OpenProcess 成功，对方句柄表里就留下了你的权限请求，
+    // 无法事后补救。误用 kWrite 做纯读取 = 明确暴露写入意图。
+    //
+    // allowMap: true 表示调用方确实要做手工映射（需要写权限）。
+    //           默认 false，纯读取路径任何写权限位都会被拒。
+    bool Begin(DWORD pid, ACCESS_MASK mask = kReadOnly, bool allowMap = false) {
+        audit_ = OpenAudit{};
+        audit_.attempted = true;
+        audit_.requested = mask;
+
+        // 第一道闸：权限掩码
+        const auto verdict = access::check_readonly(mask, allowMap);
+        audit_.passed = verdict.ok;
+        audit_.badBits = verdict.badBits;
+        audit_.reason = verdict.reason;
+        if (!verdict.ok) {
+            return false;   // 直接拒绝，连 OpenProcess 都不发
+        }
+
         const auto open = nt_open_process();
         if (!open || pid == 0) return false;
 
@@ -188,6 +219,7 @@ private:
     HANDLE h_ = nullptr;
     DWORD pid_ = 0;
     uint64_t born_ = 0;
+    OpenAudit audit_{};
 };
 
 // 探针：仅判断目标是否存在、位数是否匹配（不读数据，也不留句柄）

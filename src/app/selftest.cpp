@@ -25,6 +25,7 @@
 #include "os/config_io.hpp"
 #include "os/profile.hpp"
 #include "os/resolve.hpp"
+#include "os/accessmask.hpp"
 #include "os/guardprobe.hpp"
 #include "os/scanpattern.hpp"
 #include "os/sched.hpp"
@@ -587,9 +588,11 @@ void test_remote_resolver() {
 void test_manualmap_errors() {
     std::printf("--- 手工映射错误路径 ---\n");
     os::Session s;
-    check(s.Begin(GetCurrentProcessId(),
-                  os::Session::kWrite | PROCESS_QUERY_INFORMATION),
-          "以写权限打开自身");
+    // 手工映射确实需要写权限，显式 allowMap=true。
+    // 注意：只用 kWrite（含 VM_WRITE|VM_OPERATION），不再附加 QUERY_FULL，
+    // 后者会让权限更显眼。
+    check(s.Begin(GetCurrentProcessId(), os::Session::kWrite, true),
+          "允许映射时以写权限打开自身");
 
     mmap::PeImage empty;
     mmap::Mapped out;
@@ -1694,6 +1697,125 @@ void test_guard_budget_integration() {
     s.Close();
 }
 
+
+void test_accessmask() {
+    std::printf("--- 句柄权限掩码校验 ---\n");
+
+    // 纯读取只允许这两位
+    check(access::kPureRead == (PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION),
+          "kPureRead 只含 VM_READ + QUERY_LIMITED");
+
+    // 纯读取掩码通过
+    {
+        const auto v = access::check_readonly(access::kPureRead, false);
+        check(v.ok, "纯读取掩码通过");
+        check(v.badBits == 0, "无越权位");
+    }
+
+    // 只要 VM_READ 也通过
+    check(access::check_readonly(PROCESS_VM_READ, false).ok, "仅 VM_READ 通过");
+
+    // 只要 QUERY_LIMITED 也通过
+    check(access::check_readonly(PROCESS_QUERY_LIMITED_INFORMATION, false).ok,
+          "仅 QUERY_LIMITED 通过");
+
+    // 带写权限的必须被拒
+    {
+        const ACCESS_MASK bad = PROCESS_VM_READ | PROCESS_VM_WRITE;
+        const auto v = access::check_readonly(bad, false);
+        check(!v.ok, "含 VM_WRITE 被拒绝");
+        check((v.badBits & PROCESS_VM_WRITE) != 0, "报告出越权的 VM_WRITE");
+    }
+
+    // VM_OPERATION 也必须被拒
+    {
+        const auto v = access::check_readonly(PROCESS_VM_READ | PROCESS_VM_OPERATION, false);
+        check(!v.ok, "含 VM_OPERATION 被拒绝");
+    }
+
+    // CREATE_THREAD 永远被拒，即使 allowMap
+    {
+        const auto v = access::check_readonly(PROCESS_VM_READ | PROCESS_CREATE_THREAD, true);
+        check(!v.ok, "含 CREATE_THREAD 被拒绝（即使允许映射）");
+    }
+
+    // ALL_ACCESS 必须被拒
+    check(!access::check_readonly(PROCESS_ALL_ACCESS, false).ok,
+          "ALL_ACCESS 被拒绝（纯读取）");
+    check(!access::check_readonly(PROCESS_ALL_ACCESS, true).ok,
+          "ALL_ACCESS 被拒绝（映射）");
+
+    // allowMap 允许 VM_WRITE|VM_OPERATION，但仍不允许注入类
+    check(access::check_readonly(access::kMapNeeded, true).ok,
+          "映射所需掩码在 allowMap 下通过");
+    check(!access::check_readonly(access::kMapNeeded, false).ok,
+          "映射所需掩码在纯读取下被拒");
+
+    // 最小掩码生成
+    check(access::minimal_mask(access::Intent::ReadOnly) == access::kPureRead,
+          "ReadOnly 意图给出纯读取掩码");
+    check(access::minimal_mask(access::Intent::MapImage) == access::kMapNeeded,
+          "MapImage 意图给出映射掩码");
+
+    // 可疑度评分
+    check(access::suspicion_score(access::kPureRead) == 0, "纯读取可疑度 0");
+    check(access::suspicion_score(access::kMapNeeded) > 0, "映射掩码可疑度 > 0");
+    check(access::suspicion_score(PROCESS_ALL_ACCESS) > 200, "ALL_ACCESS 可疑度很高");
+    check(access::suspicion_score(PROCESS_VM_READ | PROCESS_CREATE_THREAD) >= 100,
+          "CREATE_THREAD 单项就很高");
+
+    // 危险位计数
+    check(access::danger_count(access::kPureRead) == 0, "纯读取无危险位");
+    check(access::danger_count(access::kMapNeeded) == 2, "映射掩码有 2 个危险位");
+    check(access::danger_count(PROCESS_ALL_ACCESS) >= 6, "ALL_ACCESS 危险位至少 6 个");
+
+    // 位名
+    check(std::string(access::bit_name(PROCESS_VM_READ)) == "VM_READ", "VM_READ 名字");
+    check(std::string(access::bit_name(PROCESS_VM_WRITE)) == "VM_WRITE", "VM_WRITE 名字");
+}
+
+void test_session_guard() {
+    std::printf("--- Session 权限闸门 ---\n");
+
+    os::Session s;
+
+    // 纯读取：正常通过
+    check(s.Begin(GetCurrentProcessId()), "默认纯读取可打开");
+    check(s.last_audit().passed, "审计记录为通过");
+    check(s.last_audit().requested == access::kPureRead, "记录请求的掩码");
+    s.Close();
+
+    // 带写权限但没声明 allowMap：必须被拒，且不发起 OpenProcess
+    os::Session s2;
+    check(!s2.Begin(GetCurrentProcessId(),
+                    PROCESS_VM_READ | PROCESS_VM_WRITE, false),
+          "带 VM_WRITE 未声明用途时被拒");
+    check(!s2.last_audit().passed, "审计记录为拒绝");
+    check((s2.last_audit().badBits & PROCESS_VM_WRITE) != 0, "报告越权位");
+    check(!s2.valid(), "被拒后没有句柄（未发起调用）");
+
+    // CREATE_THREAD：即使 allowMap 也拒
+    os::Session s3;
+    check(!s3.Begin(GetCurrentProcessId(),
+                    PROCESS_VM_READ | PROCESS_CREATE_THREAD, true),
+          "CREATE_THREAD 即使 allowMap 也被拒");
+    check(!s3.valid(), "被拒后无句柄");
+
+    // ALL_ACCESS：永远拒
+    os::Session s4;
+    check(!s4.Begin(GetCurrentProcessId(), PROCESS_ALL_ACCESS, true),
+          "ALL_ACCESS 被拒");
+    check(!s4.valid(), "被拒后无句柄");
+
+    // 映射场景：显式 allowMap 才通过
+    os::Session s5;
+    check(s5.Begin(GetCurrentProcessId(), access::kMapNeeded, true),
+          "allowMap 下映射掩码通过");
+    check(s5.valid(), "有句柄");
+    check(s5.last_audit().passed, "审计通过");
+    s5.Close();
+}
+
 void test_humanizer() {
     std::printf("--- 人类化调度 ---\n");
     input::Humanizer h;
@@ -1739,6 +1861,8 @@ int main() {
     test_sendinput_backend();
     test_raw_input_invisibility();
     test_hookprobe();
+    test_accessmask();
+    test_session_guard();
     test_guard_status();
     test_budget();
     test_trap_list();
