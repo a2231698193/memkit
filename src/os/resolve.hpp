@@ -69,6 +69,8 @@ struct Value {
         int64_t i64;
         double f64;
         struct { float x, y, z; } vec3;
+        struct { float x, y; } vec2;
+        struct { float m[16]; } mat4;   // 行主序，m[row*4+col]
     } v{};
     bool ok = false;
 
@@ -120,6 +122,19 @@ inline Value decode(const uint8_t* p, schema::VType t) noexcept {
             std::memcpy(&y, p + 4, 4);
             std::memcpy(&z, p + 8, 4);
             out.v.vec3 = {x, y, z};
+            break;
+        }
+        case schema::VType::Vec2: {
+            float x, y;
+            std::memcpy(&x, p + 0, 4);
+            std::memcpy(&y, p + 4, 4);
+            out.v.vec2 = {x, y};
+            break;
+        }
+        case schema::VType::Mat4: {
+            // 直接按 16 个 float 读，不区分行/列主序。
+            // 内存里就是 16 个连续 float，怎么解释由使用方决定。
+            std::memcpy(out.v.mat4.m, p, 64);
             break;
         }
         default: out.ok = false; break;
@@ -258,11 +273,11 @@ public:
         // kind=Chain 到此为止
         if (f.kind == schema::Kind::Chain) return r;
 
-        // 读值
+        // 读值。Mat4 需要 64 字节，所以 buffer 按最大 VType 开
         const size_t sz = schema::vtype_size(f.type);
-        if (sz == 0 || sz > 16) return r;
+        if (sz == 0 || sz > 64) return r;
 
-        uint8_t buf[16] = {};
+        uint8_t buf[64] = {};
         if (!s.Read(r.addr, buf, sz)) {
             cache_.invalidate(f.name);   // 值读不到说明结构变了
             return r;

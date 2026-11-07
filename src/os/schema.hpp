@@ -46,6 +46,8 @@ enum class VType : uint8_t {
     I32 = 5,
     F32 = 6, F64 = 7,
     Vec3 = 8,   // 3 个 float
+    Mat4 = 9,   // 4x4 矩阵，16 个 float（投影必须）
+    Vec2 = 10,  // 2 个 float
 };
 
 inline size_t vtype_size(VType t) noexcept {
@@ -58,6 +60,8 @@ inline size_t vtype_size(VType t) noexcept {
         case VType::F32: return 4;
         case VType::F64: return 8;
         case VType::Vec3: return 12;
+        case VType::Mat4: return 64;
+        case VType::Vec2: return 8;
         default: return 0;
     }
 }
@@ -154,6 +158,8 @@ inline const char* vtype_name(VType t) noexcept {
         case VType::F32: return "f32";
         case VType::F64: return "f64";
         case VType::Vec3: return "vec3";
+        case VType::Mat4: return "mat4";
+        case VType::Vec2: return "vec2";
         default: return "-";
     }
 }
@@ -174,6 +180,8 @@ inline VType parse_vtype(const std::string& s) noexcept {
     if (s == "f32") return VType::F32;
     if (s == "f64") return VType::F64;
     if (s == "vec3") return VType::Vec3;
+    if (s == "mat4") return VType::Mat4;
+    if (s == "vec2") return VType::Vec2;
     return VType::None;
 }
 
