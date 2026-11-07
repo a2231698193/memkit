@@ -1,0 +1,29 @@
+# memkit profile 示例
+#
+# 复制这一份，改这三行就能换目标：
+#   !exe / !module / !table
+#
+# 部署位置（加密后）:
+#   %LOCALAPPDATA%\<随机12位>\p.dat
+#
+# 加密种子: cfgio::kProfileSeed（编译期常量）
+
+!name   mygame
+!exe    Game.exe
+!module Game.exe
+!table  mygame
+
+# 轮询间隔（毫秒）。太小会拉高句柄占用，太大跟不上状态变化。
+!poll   500
+
+# 间隔抖动幅度（±毫秒）。固定节拍是最容易识别的时序特征。
+!jitter 120
+
+# 1 = 任何字段不可靠就停工；0 = 只记录不停工
+!strict 0
+
+# 关注字段。留空表示读表里全部字段。
+# 只读关心的字段能显著降低每次快照的读取次数。
+watch  player.hp
+watch  player.hp_max
+watch  player.pos

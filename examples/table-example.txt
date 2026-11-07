@@ -1,0 +1,59 @@
+# memkit 偏移表示例
+#
+# 所有 0x0 都是占位符，必须用调试器在真实客户端上定位后填入。
+# 完整格式见 tables/README.md 与根 README 的「核心概念」。
+
+!game      mygame
+!build     1.0.0
+!timestamp 0x00000000
+!modsize   0x00000000
+
+# ---------------------------------------------------------------
+# 静态基址：本身通常指向一个大结构体，不读值只用地址
+# 这些是最稳定的部分，但每次版本更新仍会变
+# ---------------------------------------------------------------
+player.static       chain   u64    0x0                      -
+world.static        chain   u64    0x0                      -
+entitymgr.static    chain   u64    0x0                      -
+
+# ---------------------------------------------------------------
+# 玩家状态
+#
+# 每个 value 字段都应该有 check。
+# 没有 check 的偏移等于赌运气 —— 错位时读到垃圾不会报错，
+# 只会让业务逻辑基于垃圾数据做决策。
+# ---------------------------------------------------------------
+player.base         chain   u64    0x0                      -                       # 玩家对象指针
+player.guid         value   u64    0x0,0x0                  ge 1                    # 必 > 0
+player.hp           value   u32    0x0,0x0                  inrange 1 200000
+player.hp_max       value   u32    0x0,0x0                  inrange 1 200000
+player.mp           value   u32    0x0,0x0                  inrange 0 200000
+player.mp_max       value   u32    0x0,0x0                  inrange 1 200000
+player.level        value   u32    0x0,0x0                  inrange 1 99
+player.pos          value   vec3   0x0,0x0                  -                       # 世界坐标
+player.facing       value   f32    0x0,0x0                  -                       # 朝向弧度
+player.zone_id      value   u32    0x0,0x0                  ge 1
+player.in_combat    value   u8     0x0,0x0                  inrange 0 1
+player.casting      value   u8     0x0,0x0                  inrange 0 1
+
+# ---------------------------------------------------------------
+# 当前目标
+# ---------------------------------------------------------------
+target.guid         value   u64    0x0,0x0                  ge 0                    # 0 = 无目标
+target.hp           value   u32    0x0,0x0                  inrange 0 200000        # 死亡时可为 0
+target.hp_max       value   u32    0x0,0x0                  inrange 1 200000
+target.level        value   u32    0x0,0x0                  inrange 1 99
+target.pos          value   vec3   0x0,0x0                  -
+target.reaction     value   u32    0x0,0x0                  inrange 1 8             # 敌友关系
+target.is_player    value   u8     0x0,0x0                  inrange 0 1
+
+# ---------------------------------------------------------------
+# 摄像机 / 视图矩阵
+#
+# 注意：4x4 矩阵需要 16 个 float，当前 VType 只有 vec3。
+# 要画投影得先扩展一个 Mat4 类型（见 README「待扩展」）。
+# ---------------------------------------------------------------
+camera.matrix       chain   u64    0x0                      -
+camera.fov          value   f32    0x0,0x0                  inrange 0.1 3.0
+camera.yaw          value   f32    0x0,0x0                  -
+camera.pitch        value   f32    0x0,0x0                  -
