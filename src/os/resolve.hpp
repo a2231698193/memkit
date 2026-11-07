@@ -132,8 +132,14 @@ inline Value decode(const uint8_t* p, schema::VType t) noexcept {
             break;
         }
         case schema::VType::Mat4: {
+<<<<<<< HEAD
             // 直接按 16 个 float 读，不区分行/列主序。
             // 内存里就是 16 个连续 float，怎么解释由使用方决定。
+=======
+            // 直接按 16 个 float 读，不区分行/列主序 —— 由使用方按需转置。
+            // 多数游戏引擎内部用列主序（OpenGL 风格），但内存布局就是
+            // 16 个连续 float，怎么解释由调用方决定。
+>>>>>>> 9168a9d (game/wow-classic: 魔兽世界怀旧服游戏层)
             std::memcpy(out.v.mat4.m, p, 64);
             break;
         }

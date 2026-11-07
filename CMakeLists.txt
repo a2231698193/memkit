@@ -9,6 +9,9 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
+# 游戏层：默认关闭，各 game/* 分支在 configure 时打开
+option(MEMKIT_GAME_WOW "Build World of Warcraft support layer" OFF)
+
 add_executable(memkit
     src/app/main.cpp
     src/app/wrap_stub.cpp
@@ -24,6 +27,9 @@ if(MEMKIT_SELFTEST)
     target_include_directories(selftest PRIVATE src)
     target_compile_definitions(selftest PRIVATE
         WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS _WIN32_WINNT=0x0A00)
+    if(MEMKIT_GAME_WOW)
+        target_compile_definitions(selftest PRIVATE MEMKIT_GAME_WOW=1)
+    endif()
     target_link_libraries(selftest PRIVATE bcrypt)
     if(NOT MSVC)
         target_compile_options(selftest PRIVATE -O2 -fno-rtti -fno-exceptions -Wall -Wextra -Wno-unused-parameter)

@@ -28,6 +28,12 @@
 #include "os/accessmask.hpp"
 #include "os/guardprobe.hpp"
 #include "os/scanpattern.hpp"
+
+#ifdef MEMKIT_GAME_WOW
+#include "games/wow/entity.hpp"
+#include "games/wow/w2s.hpp"
+#include "games/wow/world.hpp"
+#endif
 #include "os/sched.hpp"
 #include "os/schema.hpp"
 #include "os/task.hpp"
@@ -2062,6 +2068,249 @@ void test_scan_field_errors() {
     s.Close();
 }
 
+#ifdef MEMKIT_GAME_WOW
+
+void test_wow_projection() {
+    std::printf("--- WoW 投影 ---\n");
+
+    wow::Screen sc{1920, 1080};
+    check(sc.valid(), "屏幕尺寸有效");
+
+    wow::Mat4 id{};
+    id.m[0] = 1; id.m[5] = 1; id.m[10] = 1; id.m[15] = 1;
+    check(id.sane(), "单位矩阵判定为合理");
+
+    wow::Vec2 out{};
+    check(wow::world_to_screen_rowmajor(id, {0, 0, 0}, sc, out), "原点可投影");
+    check(std::fabs(out.x - 960) < 0.5f && std::fabs(out.y - 540) < 0.5f,
+          "原点落在屏幕中心");
+
+    check(wow::world_to_screen_rowmajor(id, {1, 1, 1}, sc, out), "(1,1,1) 可投影");
+    check(std::fabs(out.x - 1920) < 0.5f && std::fabs(out.y - 0) < 0.5f,
+          "(1,1,1) 落在右上角");
+
+    // 背面：w <= 0 必须拒绝
+    wow::Mat4 behind{};
+    behind.m[15] = -1;
+    behind.m[0] = 1; behind.m[5] = 1; behind.m[10] = 1;
+    check(!wow::world_to_screen_rowmajor(behind, {0, 0, 0}, sc, out),
+          "背面点被拒绝");
+
+    // 无效屏幕
+    wow::Screen bad{0, 0};
+    check(!bad.valid(), "零尺寸屏幕无效");
+    check(!wow::world_to_screen_rowmajor(id, {0, 0, 0}, bad, out),
+          "无效屏幕不投影");
+
+    // 矩阵 sanity
+    wow::Mat4 zeros{};
+    check(!zeros.sane(), "全零矩阵判定为坏");
+    wow::Mat4 nanm{};
+    for (int i = 0; i < 16; ++i) nanm.m[i] = std::nanf("");
+    check(!nanm.sane(), "NaN 矩阵判定为坏");
+    wow::Mat4 huge{};
+    for (int i = 0; i < 16; ++i) huge.m[i] = 1e30f;
+    check(!huge.sane(), "天文数字矩阵判定为坏");
+
+    // 列主序版本
+    const bool colOk = wow::world_to_screen_colmajor(id, {0, 0, 0}, sc, out);
+    check(colOk, "列主序版本可用");
+    check(std::fabs(out.x - 960) < 0.5f, "列主序原点也在中心");
+
+    // guess_major
+    const auto m = wow::guess_major(id, {0, 0, 0}, sc);
+    check(m == wow::Major::Row || m == wow::Major::Col || m == wow::Major::Unknown,
+          "guess_major 返回合法值");
+}
+
+void test_wow_vec() {
+    std::printf("--- WoW 向量 ---\n");
+
+    wow::Vec3 a{0, 0, 0}, b{3, 4, 0};
+    check(std::fabs(a.dist2d(b) - 5.0f) < 0.001f, "dist2d = 5");
+    check(std::fabs(a.dist3d(b) - 5.0f) < 0.001f, "dist3d = 5");
+
+    wow::Vec3 c{0, 0, 5};
+    check(std::fabs(a.dist2d(c) - 0.0f) < 0.001f, "纯高度差 dist2d = 0");
+    check(std::fabs(a.dist3d(c) - 5.0f) < 0.001f, "纯高度差 dist3d = 5");
+
+    const auto d = b - a;
+    check(d.x == 3 && d.y == 4, "减法正确");
+    const auto e = a + b;
+    check(e.x == 3 && e.y == 4, "加法正确");
+
+    check(std::fabs(wow::Vec3{1, 2, 2}.len() - 3.0f) < 0.001f, "长度 = 3");
+
+    // FOV：目标在正前方
+    check(wow::in_fov(0.0f, {0, 0, 0}, {10, 0, 0}, 1.0f), "正前方在视野内");
+    check(!wow::in_fov(3.14159f, {0, 0, 0}, {10, 0, 0}, 1.0f), "背后不在视野内");
+    check(!wow::in_fov(0.0f, {0, 0, 0}, {0, 0, 0}, 1.0f), "同点不在视野内");
+    check(!wow::in_fov(0.0f, {0, 0, 0}, {1000, 0, 0}, 1.0f, 100.0f), "超距不在视野内");
+}
+
+void test_wow_entity() {
+    std::printf("--- WoW 实体 ---\n");
+
+    wow::Entity e;
+    check(!e.valid(), "空实体无效");
+
+    e.guid = 12345;
+    e.hp = 50;
+    e.hpMax = 100;
+    e.pos = {100, 200, 5};
+    check(e.valid(), "完整实体有效");
+    check(std::fabs(e.hp_pct() - 50.0f) < 0.01f, "血量百分比 = 50");
+    check(!e.dead(), "活着的不是 dead");
+
+    e.hp = 0;
+    check(e.dead(), "血量为 0 是 dead");
+
+    e.hpMax = 0;
+    check(!e.valid(), "血上限为 0 判定无效");
+    e.hpMax = 100;
+
+    e.pos.x = 50000;
+    check(!e.valid(), "坐标超范围判定无效");
+    e.pos.x = 100;
+
+    e.guid = 0;
+    check(!e.valid(), "GUID 为 0 判定无效");
+
+    // GUID 类型判断
+    check(wow::guid_valid(123), "非 0 GUID 有效");
+    check(!wow::guid_valid(0), "0 GUID 无效");
+    check(wow::guid_is_player(0x0000000000001234ull), "低位非零且高位 0 是玩家");
+    check(!wow::guid_is_player(0x0000000000000000ull), "全 0 不是玩家");
+
+    // 列表布局
+    wow::ListLayout arr;
+    arr.stride = 8;
+    arr.objectOffset = 8;
+    check(arr.is_array(), "有 stride 无 next 判定为数组");
+
+    wow::ListLayout lnk;
+    lnk.nextOffset = 8;
+    lnk.objectOffset = 0x10;
+    check(!lnk.is_array(), "有 next 判定为链表");
+
+    // 对象布局
+    wow::ObjectLayout lo;
+    check(!lo.usable(), "空对象布局不可用");
+    lo.guid = 0x10;
+    lo.hp = 0x20;
+    lo.hpMax = 0x24;
+    lo.pos = 0x30;
+    check(lo.usable(), "完整对象布局可用");
+}
+
+void test_wow_world() {
+    std::printf("--- WoW 世界模型 ---\n");
+
+    // 空快照：所有字段必须是 Unknown，绝不能变成 0
+    state::Snapshot empty;
+    const auto we = wow::build_world(empty);
+    check(!we.player.guid.known, "空快照 guid 未知");
+    check(!we.player.alive(), "空快照不算活着");
+    check(we.player.hp_pct() < 0, "空快照血量百分比为负（未知标记）");
+    check(!we.player.has_pos(), "空快照没有位置");
+    check(!we.target.exists(), "空快照没有目标");
+    check(!we.camera.usable(), "空快照摄像机不可用");
+
+    // 完整快照
+    state::Snapshot s;
+    auto putU64 = [&](const char* n, uint64_t v) {
+        state::Field f;
+        f.status = state::Status::Present;
+        f.value.type = schema::VType::U64;
+        f.value.v.u64 = v;
+        s.put(n, f);
+    };
+    putU64("player.guid", 999);
+    putU64("player.hp", 60);
+    putU64("player.hp_max", 100);
+    putU64("player.mp", 40);
+    putU64("player.mp_max", 100);
+    putU64("target.guid", 12345);
+    putU64("target.hp", 20);
+    putU64("target.hp_max", 200);
+
+    {
+        state::Field f;
+        f.status = state::Status::Present;
+        f.value.type = schema::VType::Vec3;
+        f.value.v.vec3 = {10, 20, 30};
+        s.put("player.pos", f);
+        f.value.v.vec3 = {50, 60, 30};
+        s.put("target.pos", f);
+    }
+    {
+        state::Field f;
+        f.status = state::Status::Present;
+        f.value.type = schema::VType::U32;
+        f.value.v.u64 = 1;   // Hostile
+        s.put("target.reaction", f);
+    }
+
+    const auto w = wow::build_world(s);
+    check(w.player.guid.known && w.player.guid.value == 999, "玩家 GUID 正确");
+    check(w.player.alive(), "玩家活着");
+    check(std::fabs(w.player.hp_pct() - 60.0f) < 0.01f, "玩家血量 60%");
+    check(std::fabs(w.player.mp_pct() - 40.0f) < 0.01f, "玩家蓝量 40%");
+    check(w.player.has_pos(), "玩家有位置");
+    check(w.target.exists(), "有目标");
+    check(w.target.alive(), "目标活着");
+    check(std::fabs(w.target.hp_pct() - 10.0f) < 0.01f, "目标血量 10%");
+    check(w.target.hostile(), "目标敌对");
+    check(w.reliable, "快照可靠");
+
+    // 距离
+    // (10,20) → (50,60)：dx=40 dy=40，sqrt(3200)=56.568…
+    check(std::fabs(w.player.pos.value.dist2d(w.target.pos.value) - 56.5685f) < 0.01f,
+          "玩家与目标水平距离 sqrt(40²+40²)");
+
+    // Suspect 字段不能被当成已知
+    state::Snapshot sus;
+    state::Field sf;
+    sf.status = state::Status::Suspect;
+    sf.value.type = schema::VType::U32;
+    sf.value.v.u64 = 12345;
+    sus.put("player.hp", sf);
+    const auto ws = wow::build_world(sus);
+    check(!ws.player.hp.known, "Suspect 字段不算已知");
+}
+
+void test_wow_client_profile() {
+    std::printf("--- WoW 客户端 profile ---\n");
+
+    // 三个客户端变体的关键差异
+    struct Case {
+        const char* exe;
+        const char* table;
+        const char* note;
+    };
+    const Case cases[] = {
+        {"WowClassic.exe", "wow-classic-era", "经典旧世 1.15.x"},
+        {"WowClassic.exe", "wow-classic-wotlk", "巫妖王怀旧 3.4.x"},
+        {"Wow.exe", "wow-retail", "正式服 11.x"},
+    };
+
+    for (const auto& c : cases) {
+        profile::Profile p;
+        p.name = c.table;
+        p.exe = c.exe;
+        p.table = c.table;
+        p.poll_ms = 250;
+        check(p.valid(), c.note);
+        check(p.module_name() == c.exe, "module 回落 exe");
+    }
+
+    // 经典旧世和巫妖王进程名相同 —— 必须靠模块时间戳或 build 区分
+    check(std::string("WowClassic.exe") == std::string("WowClassic.exe"),
+          "两个怀旧服变体进程名相同");
+}
+
+#endif  // MEMKIT_GAME_WOW
+
 void test_humanizer() {
     std::printf("--- 人类化调度 ---\n");
     input::Humanizer h;
@@ -2132,6 +2381,13 @@ int main() {
     test_schema_encrypt_roundtrip();
     test_profile();
     test_profile_storage();
+#ifdef MEMKIT_GAME_WOW
+    test_wow_projection();
+    test_wow_vec();
+    test_wow_entity();
+    test_wow_world();
+    test_wow_client_profile();
+#endif
     test_humanizer();
 
     std::printf("============================\n");

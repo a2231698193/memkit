@@ -1,0 +1,46 @@
+# 魔兽世界怀旧服 profile
+#
+# 客户端类型决定进程名和模块名：
+#
+#   经典旧世 (Classic Era, 1.15.x)   WowClassic.exe
+#   巫妖王怀旧 (WotLK Classic, 3.4.x) WowClassic.exe
+#   正式服 (Retail, 11.x)            Wow.exe
+#
+# 三者二进制完全不同，偏移表不能通用。装好后先确认是哪个。
+
+!name   wow-classic-era
+!exe    WowClassic.exe
+!module WowClassic.exe
+!table  wow-classic-era
+
+# 轮询间隔
+# 500ms 对打怪/采集够用；要跟战斗节奏（技能 CD、打断）需要 100~200ms。
+# 但间隔越小，句柄打开/关闭越频繁，暴露面越大。取平衡。
+!poll   250
+
+# 抖动：固定节拍是最容易被识别的时序特征
+!jitter 90
+
+# 1 = 任何字段不可靠就停工；0 = 只记录不停工
+#
+# 首次跑建议 1：偏移还没验证过的时候，宁可停也不要带错数据跑。
+# 偏移稳定后改回 0，避免偶发读失败导致意外停机。
+!strict 1
+
+# 关注字段（只读这些，降低每次快照的读取次数）
+watch  player.guid
+watch  player.hp
+watch  player.hp_max
+watch  player.mp
+watch  player.mp_max
+watch  player.pos
+watch  player.facing
+watch  player.level
+watch  player.in_combat
+watch  player.casting
+watch  target.guid
+watch  target.hp
+watch  target.hp_max
+watch  target.pos
+watch  target.reaction
+watch  camera.matrix

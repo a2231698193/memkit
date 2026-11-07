@@ -1,0 +1,156 @@
+# 魔兽世界怀旧服（经典旧世 1.15.x）偏移表
+#
+# === 当前状态：全部是占位符 ===
+#
+# 所有 0x0 必须用调试器在真实客户端上定位后填入。
+# 这份文件的作用是：把要找的东西列清楚，以及每个字段该怎么验证。
+#
+# === 定位顺序（按依赖关系）===
+#
+#   1. player.guid      —— 最基础。拿到 GUID 才能确认"这是本地玩家"
+#   2. player.hp / pos  —— 依赖 player.base 解引用
+#   3. camera.matrix    —— 做投影必须
+#   4. target.*         —— 依赖目标选择逻辑
+#   5. objects.*        —— 最复杂，最后做
+#
+# === 验证方式 ===
+#
+#   每个 value 字段都带 check。填完后先跑一遍，看健康度是不是 100%。
+#   strict=1 模式下任何 Suspect/Unknown 都会停机，能立刻发现问题。
+#
+# === 已知的坑 ===
+#
+#   * WoW 的坐标是 float，但 y 轴是高度（不是 z）。很多教程写 pos.x/y/z
+#     其实对应 x=东西, y=南北, z=高度。用 vec3 读出来要按实际含义命名。
+#   * GUID 高 16 位是类型标记，低位才是有效 ID。判断"是不是玩家"要查高位。
+#   * 血/蓝在客户端里可能有多个副本（当前值、预测值、显示值）。
+#     要读的是引擎的权威值，不是 UI 缓存值。
+
+!game      wow-classic-era
+!build     0.0.0.0
+!timestamp 0x00000000
+!modsize   0x00000000
+
+# ===============================================================
+# 静态基址
+#
+# 这些是"根"。定位方法：
+#   1. 用 Cheat Engine / x64dbg 找到 player.hp 的地址
+#   2. 对地址做指针扫描，往上追到模块内静态偏移
+#   3. 追到不能再追（下一层是模块基址）为止
+#
+# WoW 的静态基址通常在 .data 段，形如 WowClassic.exe+0x2F1A3B0。
+# ===============================================================
+
+player.static       chain   u64    0x0                      -    # 玩家对象管理器
+world.static        chain   u64    0x0                      -    # 世界对象（含区域信息）
+objectmgr.static    chain   u64    0x0                      -    # 实体列表管理器
+camera.static       chain   u64    0x0                      -    # 视图矩阵
+
+# ===============================================================
+# 本地玩家
+#
+# player.base 解析出的地址是"玩家对象"，下面所有 player.* 都是
+# 从这个对象再解引用 + 偏移得到的。
+# ===============================================================
+
+player.base         chain   u64    0x0                      -                       # 玩家对象指针
+player.guid         value   u64    0x0,0x0                  ge 1                    # 必 > 0，否则不是玩家
+player.hp           value   u32    0x0,0x0                  inrange 1 200000
+player.hp_max       value   u32    0x0,0x0                  inrange 1 200000
+player.mp           value   u32    0x0,0x0                  inrange 0 200000
+player.mp_max       value   u32    0x0,0x0                  inrange 1 200000
+player.level        value   u32    0x0,0x0                  inrange 1 80            # 经典旧世上限 60，留余量
+player.pos          value   vec3   0x0,0x0                  -                       # 世界坐标
+player.facing       value   f32    0x0,0x0                  -                       # 朝向弧度
+player.zone_id      value   u32    0x0,0x0                  ge 1
+player.in_combat    value   u8     0x0,0x0                  inrange 0 1
+player.mounted      value   u8     0x0,0x0                  inrange 0 1
+player.casting      value   u8     0x0,0x0                  inrange 0 1             # 正在施法
+player.cast_id      value   u32    0x0,0x0                  ge 0                    # 法术 ID，0=没在施法
+player.cast_left    value   f32    0x0,0x0                  ge 0                    # 剩余施法时间（秒）
+
+# ===============================================================
+# 当前目标
+#
+# target.guid = 0 表示没有目标。这是一个合法状态，所以 check 用 ge 0。
+# ===============================================================
+
+target.guid         value   u64    0x0,0x0                  ge 0
+target.hp           value   u32    0x0,0x0                  inrange 0 200000        # 死亡时为 0
+target.hp_max       value   u32    0x0,0x0                  inrange 1 200000
+target.level        value   u32    0x0,0x0                  inrange 1 83
+target.pos          value   vec3   0x0,0x0                  -
+target.facing       value   f32    0x0,0x0                  -
+target.reaction     value   u32    0x0,0x0                  inrange 1 8             # 1敌对 4友善
+target.is_player    value   u8     0x0,0x0                  inrange 0 1
+target.casting      value   u8     0x0,0x0                  inrange 0 1
+target.cast_id      value   u32    0x0,0x0                  ge 0
+
+# ===============================================================
+# 摄像机 / 投影矩阵
+#
+# 这是 4x4 矩阵，64 个字节。用 mat4 类型读。
+#
+# !! 必须先确认行主序还是列主序 !!
+#
+#   wow::guess_major() 可以自动判断，但需要一次实测。
+#   拿两个已知坐标点（比如自己和目标）投影，看哪个序的落点在屏幕内。
+#
+# 验证方式：self 和 target 的屏幕距离应该和世界距离成正比。
+# 如果投影出来的人在脚下打转，说明矩阵序反了。
+# ===============================================================
+
+camera.matrix       chain   u64    0x0                      -                       # 矩阵起始地址
+camera.matrix_data  value   mat4   0x0,0x0                  -                       # 16 个 float
+camera.fov          value   f32    0x0,0x0                  inrange 0.1 3.0
+camera.yaw          value   f32    0x0,0x0                  -
+camera.pitch        value   f32    0x0,0x0                  -
+
+# ===============================================================
+# 实体列表
+#
+# 这块结构最复杂。WoW 用的是分块数组 + 链表，不是连续内存。
+#
+# 遍历需要三个信息：
+#   objects.first        列表头 → 首条目
+#   objects.next_off     条目内 "下一个" 指针偏移
+#   objects.obj_off      条目内 "对象" 指针偏移
+#
+# 如果实际是连续数组（is_array），改用 stride。
+#
+# 判断方法：读列表头 + 偏移，看拿到的值是"指针"还是"对象"。
+#   连续数组：stride 处就是下一个对象
+#   链表：    next_off 处是指向下一条目的指针
+# ===============================================================
+
+objects.first       chain   u64    0x0                      -                       # 首条目地址
+objects.count       value   u32    0x0,0x0                  inrange 0 5000
+objects.next_off    value   u32    0x0,0x0                  inrange 8 0x1000        # 链式布局用
+objects.stride      value   u32    0x0,0x0                  inrange 8 0x200         # 数组布局用
+objects.obj_off     value   u32    0x0,0x0                  inrange 0 0x1000        # 条目→对象
+
+# ===============================================================
+# 对象内字段布局（不是模块基址链，是"对象 + 偏移"）
+#
+# 这些值填进 wow::ObjectLayout（见 src/games/wow/entity.hpp）。
+# 单独列在这里便于对比版本差异。
+# ===============================================================
+
+# object.guid         0x0
+# object.hp           0x0
+# object.hp_max       0x0
+# object.mp           0x0
+# object.mp_max       0x0
+# object.level        0x0
+# object.pos          0x0
+# object.facing       0x0
+# object.reaction     0x0
+
+# ===============================================================
+# 界面状态（可选，比读游戏对象稳但延迟高）
+# ===============================================================
+
+ui.casting_progress value   f32    0x0,0x0                  inrange 0.0 1.0
+ui.loot_window      value   u8     0x0,0x0                  inrange 0 1
+ui.gossip_window    value   u8     0x0,0x0                  inrange 0 1
