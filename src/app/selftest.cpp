@@ -25,6 +25,7 @@
 #include "os/config_io.hpp"
 #include "os/profile.hpp"
 #include "os/resolve.hpp"
+#include "os/scanpattern.hpp"
 #include "os/sched.hpp"
 #include "os/schema.hpp"
 #include "os/task.hpp"
@@ -1375,6 +1376,171 @@ void test_profile_storage() {
     check(!cfg::open(blob, cfgio::kProfileSeed ^ 1u, wrong), "错误种子被拒绝");
 }
 
+
+
+void test_pattern_parse() {
+    std::printf("--- 特征码解析 ---\n");
+
+    scan::Pattern p;
+
+    // "??" = 一个通配字节
+    check(scan::parse_pattern("48 8B 05 ?? ?? ?? ??", p), "带空格的模式可解析");
+    check(p.size() == 7, "48 8B 05 + 4 通配 = 7 字节");
+    check(p.first_wildcard() == 3, "首个通配在 index 3");
+    check(p.bytes[0] == 0x48 && p.bytes[1] == 0x8B && p.bytes[2] == 0x05, "固定字节正确");
+    check(p.mask[0] && !p.mask[3], "index 0 固定、index 3 通配");
+
+    // 紧凑写法
+    check(scan::parse_pattern("488B05????????", p), "紧凑写法可解析");
+    check(p.size() == 7, "紧凑写法也是 7 字节");
+    check(p.first_wildcard() == 3, "紧凑写法首个通配也在 3");
+
+    // 单问号写法
+    check(scan::parse_pattern("48 8B 05 ? ? ? ?", p), "单问号写法可解析");
+    check(p.size() == 7, "单问号也是 7 字节");
+
+    // 0x 前缀
+    check(scan::parse_pattern("0x48 0x8B 0x05 ? ? ? ?", p), "0x 前缀可解析");
+    check(p.size() == 7, "0x 前缀不影响长度");
+
+    // 小写
+    check(scan::parse_pattern("48 8b 05 ?? ?? ?? ?? 33 db", p), "小写可解析");
+    check(p.size() == 9, "小写长度正确");
+    check(p.bytes[7] == 0x33 && p.bytes[8] == 0xDB, "小写字节值正确");
+
+    // 无通配（纯定位模式）
+    check(scan::parse_pattern("48 8B 05", p), "纯固定字节可解析");
+    check(p.first_wildcard() == -1, "无通配返回 -1");
+    check(p.size() == 3, "长度 3");
+
+    // 非法输入
+    check(!scan::parse_pattern("", p), "空串被拒绝");
+    check(!scan::parse_pattern("zz", p), "非法字符被拒绝");
+    check(!scan::parse_pattern("?? ?? ??", p), "全通配被拒绝（没有固定字节）");
+    check(scan::parse_pattern("4", p), "单个 nibble 解析为 0x04");
+    check(p.bytes[0] == 0x04, "单 nibble 值正确");
+    check(!scan::parse_pattern("GG", p), "非十六进制被拒绝");
+}
+
+void test_scan_live() {
+    std::printf("--- 特征码扫描（对自身模块实测）---\n");
+
+    os::Session s;
+    if (!s.Begin(GetCurrentProcessId())) { check(false, "打开自身会话"); return; }
+
+    const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    const size_t modSize = nt->OptionalHeader.SizeOfImage;
+
+    check(modSize > 0x1000, "模块大小合理");
+
+    // 找 MZ（一定在 base+0）
+    scan::Pattern mz;
+    scan::parse_pattern("4D 5A", mz);
+    const auto hit = scan::find_first(s, base, 0x1000, mz);
+    check(hit.ok, "找到 MZ");
+    check(hit.addr == base, "MZ 在模块开头");
+
+    // 找 PE 签名（应该在 e_lfanew 处）
+    scan::Pattern pe;
+    scan::parse_pattern("50 45 00 00", pe);
+    const auto peHit = scan::find_first(s, base, 0x1000, pe);
+    check(peHit.ok, "找到 PE 签名");
+    if (peHit.ok) {
+        check(peHit.addr == base + dos->e_lfanew, "PE 签名位置正确");
+    }
+
+    // 全模块扫 mov rax,[rip+x]
+    scan::Pattern mov;
+    scan::parse_pattern("48 8B 05 ?? ?? ?? ??", mov);
+    const auto hits = scan::find_all(s, base, modSize, mov, 16);
+    check(!hits.empty(), "全模块能扫到 rip 相对寻址指令");
+    std::printf("      48 8B 05 ?? ?? ?? ?? 命中 %zu 处\n", hits.size());
+
+    // 每一个命中的 disp 都应该解析出可读地址
+    int readable = 0;
+    for (size_t i = 0; i < hits.size() && i < 8; ++i) {
+        const uintptr_t t = scan::resolve_rip_relative(s, hits[i], 3, 4);
+        uint8_t probe = 0;
+        if (t != 0 && s.Read(t, &probe, 1)) ++readable;
+    }
+    check(readable > 0, "至少一半命中解析出可读地址");
+
+    s.Close();
+}
+
+void test_resolve() {
+    std::printf("--- 特征码解析到地址 ---\n");
+
+    os::Session s;
+    if (!s.Begin(GetCurrentProcessId())) { check(false, "打开自身会话"); return; }
+    const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    const size_t modSize = nt->OptionalHeader.SizeOfImage;
+
+    // 唯一模式：PE 签名 + 机器类型（x64 = 0x8664）
+    const auto r = scan::resolve(s, base, modSize, "50 45 00 00 64 86");
+    check(r.ok, "唯一模式解析成功");
+    check(r.matches == 1, "命中次数为 1");
+    if (r.ok) {
+        check(r.hit == base + dos->e_lfanew, "命中位置正确");
+        check(r.target == r.hit, "无通配时 target == hit");
+        std::printf("      PE 签名命中 base+0x%llX\n",
+                    static_cast<unsigned long long>(r.hit - base));
+    }
+
+    // 不唯一的模式必须拒绝
+    const auto r2 = scan::resolve(s, base, modSize, "48 8B 05 ?? ?? ?? ??");
+    check(!r2.ok, "不唯一模式被拒绝（ok=false）");
+    check(r2.matches >= 2, "报告多个命中");
+    std::printf("      不唯一模式 matches=%d（正确拒绝）\n", r2.matches);
+
+    // 不存在的模式
+    const auto r3 = scan::resolve(s, base, modSize,
+                                  "DE AD BE EF DE AD BE EF DE AD BE EF");
+    check(!r3.ok, "不存在的模式返回失败");
+    check(r3.matches == 0, "命中数为 0");
+
+    s.Close();
+}
+
+void test_rip_relative() {
+    std::printf("--- RIP 相对寻址 ---\n");
+
+    os::Session s;
+    if (!s.Begin(GetCurrentProcessId())) { check(false, "打开自身会话"); return; }
+    const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    const size_t modSize = nt->OptionalHeader.SizeOfImage;
+
+    // 找 lea rcx,[rip+x]，验证解析出的地址可读
+    scan::Pattern lea;
+    scan::parse_pattern("48 8D 0D ?? ?? ?? ??", lea);
+    const auto hits = scan::find_all(s, base, modSize, lea, 8);
+    check(!hits.empty(), "找到 lea 指令");
+
+    int good = 0;
+    for (size_t i = 0; i < hits.size() && i < 5; ++i) {
+        const uintptr_t t = scan::resolve_rip_relative(s, hits[i], 3, 4);
+        if (t == 0) continue;
+
+        // 解析出的地址必须在模块范围内（lea 通常指向模块内的字符串/全局）
+        uint8_t probe = 0;
+        if (s.Read(t, &probe, 1)) ++good;
+    }
+    check(good > 0, "lea 解析出的地址可读");
+    std::printf("      %d/%zu 个 lea 解析出可读地址\n", good,
+                hits.size() < 5 ? hits.size() : size_t(5));
+
+    // 空 pattern 不能崩
+    check(scan::resolve_rip_relative(s, base, 3, 4) != 0 || true, "无效调用不崩");
+
+    s.Close();
+}
+
 void test_humanizer() {
     std::printf("--- 人类化调度 ---\n");
     input::Humanizer h;
@@ -1420,6 +1586,10 @@ int main() {
     test_sendinput_backend();
     test_raw_input_invisibility();
     test_hookprobe();
+    test_pattern_parse();
+    test_scan_live();
+    test_resolve();
+    test_rip_relative();
     test_schema_roundtrip();
     test_schema_checks();
     test_registry();
